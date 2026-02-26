@@ -131,7 +131,7 @@ def generate_singal(args, model_name, test_case):
         }
         model_inference.write_result(result_to_write, model_name, result_path)
 
-def generate_results(args, model_name, test_case, completed_id_set):
+def generate_results(args, model_name, test_cases_total, completed_id_set):
     with ThreadPoolExecutor(max_workers = args.num_threads) as executor:
         futures = []
         for test_case in test_cases_total:
