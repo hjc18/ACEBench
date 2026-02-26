@@ -72,8 +72,12 @@ def sort_json(file):
 
 def generate_singal(args, model_name, test_case):
     model_path = args.model_path 
-    result_path = args.result_path
-    model_inference = inference_map[model_name](model_name, model_path, args.temperature, args.top_p, args.max_tokens, args.max_dialog_turns, args.user_model, args.language)
+    result_path = args.result_path        
+    model_inference = inference_map[model_name](
+        model_name, model_path, 
+        args.temperature, args.top_p, 
+        args.max_tokens, args.max_dialog_turns, args.user_model, args.language
+    )
 
     if "agent" in test_case["id"]:
         id, question, functions = (
