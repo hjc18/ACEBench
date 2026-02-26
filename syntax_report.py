@@ -1,7 +1,9 @@
 import json
+import os
 import re
-from typing import Dict, Any, List, Optional, Tuple
-import os, sys
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Match, Optional, Tuple
 
 FUNC_CALL_RE = re.compile(
     r"""
@@ -47,30 +49,34 @@ BARE_CALL_RE = re.compile(
 IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
 
 
-def _strip_ws(s: str) -> str:
-    return s.strip()
+@dataclass(frozen=True)
+class BracketIdentBlock:
+    start: int
+    end: int
+    raw: str
+    has_open_paren: bool
 
 
-def _remove_single_think_block(text: str) -> Tuple[str, Optional[Tuple[int, int]], Dict[str, Any]]:
+def _remove_single_think_block(text: str) -> Tuple[str, Dict[str, Any]]:
     open_cnt = len(re.findall(r"<think>", text))
     close_cnt = len(re.findall(r"</think>", text))
     details = {"open_count": open_cnt, "close_count": close_cnt}
 
     if open_cnt == 0 and close_cnt == 0:
-        return text, None, {"status": "none", "details": details, "content": None}
+        return text, {"status": "none", "details": details, "content": None}
 
     if open_cnt == 1 and close_cnt == 1:
         m = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
         if not m:
-            return text, None, {"status": "incomplete", "details": details, "content": None}
+            return text, {"status": "incomplete", "details": details, "content": None}
         content = m.group(1)
-        status = "empty" if _strip_ws(content) == "" else "normal"
+        status = "empty" if content.strip() == "" else "normal"
         span = (m.start(), m.end())
         outside = text[:span[0]] + text[span[1]:]
-        return outside, span, {"status": status, "details": details, "content": content}
+        return outside, {"status": status, "details": details, "content": content}
 
     status = "incomplete" if open_cnt != close_cnt else "multiple"
-    return text, None, {"status": status, "details": details, "content": None}
+    return text, {"status": status, "details": details, "content": None}
 
 
 def _split_top_level_commas(s: str, keep_empty: bool = False) -> List[str]:
@@ -212,8 +218,9 @@ def check_llm_tool_output(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     Loose checker:
       1) <think> formatting: exactly one pair; status: normal/none/empty/multiple/incomplete
-      2) Function call outside think: exactly one bracketed call (no extra text):
-           [FuncName(key=VALUE, ...)]
+      2) Function call outside think (no extra text):
+           - Single call: [FuncName(key=VALUE, ...)]
+           - Multi-call list in one bracket: [FuncA(...), FuncB(...), ...]
          - VALUE can be ANY text (strings, numbers, lists, dicts, identifiers, etc.)
          - We do NOT parse values; we just validate 'key=...' pairs separated by top-level commas.
          status: normal/none/multiple/incomplete
@@ -236,7 +243,7 @@ def check_llm_tool_output(obj: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
-    outside, think_span, think_info = _remove_single_think_block(text)
+    outside, think_info = _remove_single_think_block(text)
     report["think"] = think_info
 
     outside_stripped = outside.strip()
@@ -315,14 +322,14 @@ def _find_matching_bracket(text: str, start: int) -> Optional[int]:
     return None
 
 
-def _scan_bracket_ident_blocks(text: str) -> Dict[str, Any]:
+def _scan_bracket_ident_blocks(text: str) -> Tuple[List[BracketIdentBlock], int]:
     """
     Scan bracket blocks that start like [Identifier ...] outside quotes.
     Returns:
       - blocks: list[{start, end, raw, has_open_paren}]
       - call_start_count: count of '[Identifier(' starts (balanced or not)
     """
-    blocks: List[Dict[str, Any]] = []
+    blocks: List[BracketIdentBlock] = []
     call_start_count = 0
     i = 0
     in_sq = in_dq = esc = False
@@ -376,18 +383,20 @@ def _scan_bracket_ident_blocks(text: str) -> Dict[str, Any]:
 
         end = _find_matching_bracket(text, i)
         if end is not None:
-            blocks.append({
-                "start": i,
-                "end": end,
-                "raw": text[i:end + 1],
-                "has_open_paren": has_open_paren,
-            })
+            blocks.append(
+                BracketIdentBlock(
+                    start=i,
+                    end=end,
+                    raw=text[i:end + 1],
+                    has_open_paren=has_open_paren,
+                )
+            )
             i = end + 1
             continue
 
         i += 1
 
-    return {"blocks": blocks, "call_start_count": call_start_count}
+    return blocks, call_start_count
 
 
 def _parse_kv_args(args_raw: str) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
@@ -426,14 +435,75 @@ def _parse_kv_args(args_raw: str) -> Tuple[Optional[Dict[str, str]], Optional[Di
     return kv, None
 
 
-def _check_function_call(text: str) -> Dict[str, Any]:
+def _parse_bare_call_expr(expr: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Validate that *text* is exactly one [FuncName(key=VALUE, ...)] call.
+    Parse a bare function-call expression: Name(key=VALUE, ...)
+    """
+    stripped = expr.strip()
+    match = BARE_CALL_RE.fullmatch(stripped)
+    if match is None:
+        return None, {"reason": "Not a bare function call expression.", "bad_item": expr}
 
-    Returns a call-report dict with keys: status, details, name, args_raw, args_kv_raw.
-    Status is one of: normal, none, multiple, incomplete.
+    args_raw = match.group("args")
+    kv, err = _parse_kv_args(args_raw)
+    if err is not None:
+        return None, {
+            "reason": "Invalid arguments in function call expression.",
+            "bad_item": expr,
+            "arg_error": err,
+        }
+
+    return {
+        "name": match.group("name"),
+        "args_raw": args_raw,
+        "args_kv_raw": kv,
+    }, None
+
+
+def _parse_single_bracket_multi_calls(text: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
     """
-    result: Dict[str, Any] = {
+    Parse this format:
+      [CallA(...), CallB(...), ...]
+    Returns:
+      - (calls, None) if this exact multi-call format is valid with >=2 calls
+      - (None, err) if it clearly attempts this format but is malformed
+      - (None, None) if it does not look like this format
+    """
+    stripped = text.strip()
+    if not stripped.startswith("["):
+        return None, None
+
+    end = _find_matching_bracket(stripped, 0)
+    if end is None or end != len(stripped) - 1:
+        return None, None
+
+    inside = stripped[1:-1].strip()
+    if inside == "":
+        return None, None
+
+    parts = _split_top_level_commas(inside, keep_empty=True)
+    if len(parts) < 2:
+        return None, None
+
+    parsed_calls: List[Dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        if part.strip() == "":
+            return None, {
+                "reason": "Empty call segment in multi-call bracket.",
+                "segment_index": index,
+            }
+
+        parsed, err = _parse_bare_call_expr(part)
+        if err is not None:
+            err["segment_index"] = index
+            return None, err
+        parsed_calls.append(parsed)
+
+    return parsed_calls, None
+
+
+def _empty_call_report() -> Dict[str, Any]:
+    return {
         "status": None,
         "details": {},
         "name": None,
@@ -441,20 +511,52 @@ def _check_function_call(text: str) -> Dict[str, Any]:
         "args_kv_raw": None,
     }
 
+
+def _mark_incomplete(report: Dict[str, Any], reason: str, **details: Any) -> Dict[str, Any]:
+    report["status"] = "incomplete"
+    payload = {"reason": reason}
+    payload.update(details)
+    report["details"] = payload
+    return report
+
+
+def _check_function_call(text: str) -> Dict[str, Any]:
+    """
+    Validate that *text* is either:
+      - exactly one [FuncName(key=VALUE, ...)] call
+      - a single bracket with multiple calls [FuncA(...), FuncB(...), ...]
+
+    Returns a call-report dict with keys: status, details, name, args_raw, args_kv_raw.
+    Status is one of: normal, none, multiple, incomplete.
+    """
+    result = _empty_call_report()
+
     stripped = text.strip()
     if stripped == "":
         result["status"] = "none"
         return result
 
-    scan = _scan_bracket_ident_blocks(stripped)
-    blocks = scan["blocks"]
-    call_like_blocks = [b for b in blocks if b["has_open_paren"]]
-    unclosed_call_starts = max(0, scan["call_start_count"] - len(call_like_blocks))
+    multi_calls, multi_err = _parse_single_bracket_multi_calls(stripped)
+    if multi_calls is not None:
+        result["status"] = "multiple"
+        result["details"] = {
+            "format": "single_bracket_list",
+            "call_count": len(multi_calls),
+            "calls": multi_calls,
+        }
+        return result
+    if multi_err is not None:
+        reason = multi_err.pop("reason")
+        return _mark_incomplete(result, reason, **multi_err)
 
-    parsed_call_blocks: List[Tuple[Dict[str, Any], Any]] = []
-    malformed_call_blocks: List[Dict[str, Any]] = []
+    blocks, call_start_count = _scan_bracket_ident_blocks(stripped)
+    call_like_blocks = [block for block in blocks if block.has_open_paren]
+    unclosed_call_starts = max(0, call_start_count - len(call_like_blocks))
+
+    parsed_call_blocks: List[Tuple[BracketIdentBlock, Match[str]]] = []
+    malformed_call_blocks: List[BracketIdentBlock] = []
     for block in call_like_blocks:
-        bm = FUNC_CALL_RE.fullmatch(block["raw"])
+        bm = FUNC_CALL_RE.fullmatch(block.raw)
         if bm is None:
             malformed_call_blocks.append(block)
             continue
@@ -463,7 +565,7 @@ def _check_function_call(text: str) -> Dict[str, Any]:
     whole_parsed_call_blocks = [
         (block, bm)
         for block, bm in parsed_call_blocks
-        if block["start"] == 0 and block["end"] == len(stripped) - 1
+        if block.start == 0 and block.end == len(stripped) - 1
     ]
 
     if len(whole_parsed_call_blocks) == 1 and len(parsed_call_blocks) == 1 and unclosed_call_starts == 0:
@@ -483,69 +585,86 @@ def _check_function_call(text: str) -> Dict[str, Any]:
 
     if len(parsed_call_blocks) > 1:
         result["status"] = "multiple"
-        result["details"]["found_blocks"] = [b["raw"] for b, _ in parsed_call_blocks]
+        result["details"]["found_blocks"] = [b.raw for b, _ in parsed_call_blocks]
         return result
 
     if len(parsed_call_blocks) == 1:
         block, _ = parsed_call_blocks[0]
-        result["status"] = "incomplete"
-        result["details"] = {
-            "reason": "Extra non-whitespace text outside [Name(...)] block.",
-            "found_block": block["raw"],
-        }
-        prefix = stripped[:block["start"]].strip()
-        suffix = stripped[block["end"] + 1:].strip()
+        details: Dict[str, Any] = {"found_block": block.raw}
+        prefix = stripped[:block.start].strip()
+        suffix = stripped[block.end + 1:].strip()
         if prefix:
-            result["details"]["prefix_text"] = prefix
+            details["prefix_text"] = prefix
         if suffix:
-            result["details"]["suffix_text"] = suffix
+            details["suffix_text"] = suffix
         if unclosed_call_starts > 0:
-            result["details"]["unclosed_call_starts"] = unclosed_call_starts
-        return result
+            details["unclosed_call_starts"] = unclosed_call_starts
+        return _mark_incomplete(
+            result,
+            "Extra non-whitespace text outside [Name(...)] block.",
+            **details,
+        )
 
     if unclosed_call_starts > 0:
-        result["status"] = "incomplete"
-        result["details"] = {
-            "reason": "Unclosed [Name(...)] block.",
-            "unclosed_call_starts": unclosed_call_starts,
-        }
-        return result
+        return _mark_incomplete(
+            result,
+            "Unclosed [Name(...)] block.",
+            unclosed_call_starts=unclosed_call_starts,
+        )
 
     if malformed_call_blocks:
-        result["status"] = "incomplete"
-        result["details"] = {
-            "reason": "Malformed [Name(...)] block.",
-            "found_block": malformed_call_blocks[0]["raw"],
-        }
-        return result
+        return _mark_incomplete(
+            result,
+            "Malformed [Name(...)] block.",
+            found_block=malformed_call_blocks[0].raw,
+        )
 
     ident_bracket_match = IDENT_BRACKET_RE.fullmatch(stripped)
     if ident_bracket_match is not None:
-        result["status"] = "incomplete"
-        result["details"] = {
-            "reason": "Bracketed function name is missing '(...)'.",
-            "name": ident_bracket_match.group("name"),
-        }
-        return result
+        return _mark_incomplete(
+            result,
+            "Bracketed function name is missing '(...)'.",
+            name=ident_bracket_match.group("name"),
+        )
 
     bare_call_match = BARE_CALL_RE.fullmatch(stripped)
     if bare_call_match is not None:
-        result["status"] = "incomplete"
         result["name"] = bare_call_match.group("name")
         result["args_raw"] = bare_call_match.group("args")
-        result["details"] = {"reason": "Missing surrounding [ ... ] around function call."}
-        return result
+        return _mark_incomplete(result, "Missing surrounding [ ... ] around function call.")
 
     if blocks:
-        result["status"] = "incomplete"
-        result["details"] = {
-            "reason": "Bracketed identifier block is not a valid function-call format.",
-            "found_block": blocks[0]["raw"],
-        }
-        return result
+        return _mark_incomplete(
+            result,
+            "Bracketed identifier block is not a valid function-call format.",
+            found_block=blocks[0].raw,
+        )
 
     result["status"] = "none"
     return result
+
+
+def _count_statuses(diagnosis: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    status_counts = {
+        "think": {},
+        "call": {},
+    }
+    for report in diagnosis:
+        think_status = report["think"]["status"]
+        call_status = report["call"]["status"]
+        status_counts["think"][think_status] = status_counts["think"].get(think_status, 0) + 1
+        status_counts["call"][call_status] = status_counts["call"].get(call_status, 0) + 1
+    return status_counts
+
+
+def _diagnose_examples(examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [check_llm_tool_output(example) for example in examples]
+
+
+def _load_jsonl(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as file:
+        return [json.loads(line) for line in file]
+
 
 if __name__ == "__main__":
     # Example usage
@@ -555,27 +674,14 @@ if __name__ == "__main__":
     # print(result)
     # quit()
     result_dir = sys.argv[1] if len(sys.argv) > 1 else "syntax_check_samples"
-    for root, dirs, files in os.walk(result_dir):
+    for root, _dirs, files in os.walk(result_dir):
         for file in files:
             if not file.startswith("data_") or not file.endswith("_result.json"):
                 continue
-            with open(os.path.join(root, file), "r", encoding="utf-8") as f:
-                examples = [json.loads(line) for line in f]
-            diagnosis = []
-            for ex in examples:
-                report = check_llm_tool_output(ex)
-                diagnosis.append(report)
-            # stats
-            status_counts = {
-                "think": {},
-                "call": {},
-            }
-
-            for r in diagnosis:
-                tstatus = r["think"]["status"]
-                cstatus = r["call"]["status"]
-                status_counts["think"][tstatus] = status_counts["think"].get(tstatus, 0) + 1
-                status_counts["call"][cstatus] = status_counts["call"].get(cstatus, 0) + 1
+            input_path = os.path.join(root, file)
+            examples = _load_jsonl(input_path)
+            diagnosis = _diagnose_examples(examples)
+            status_counts = _count_statuses(diagnosis)
             diagnosis_file = os.path.join(root, f"diagnosis_{file}")
             with open(diagnosis_file, "w", encoding="utf-8") as f:
                 json.dump({"status_counts": status_counts, "reports": diagnosis}, f, ensure_ascii=False, indent=2)
