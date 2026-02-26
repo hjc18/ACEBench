@@ -57,6 +57,16 @@ class BracketIdentBlock:
     has_open_paren: bool
 
 
+def _is_word_apostrophe(text: str, idx: int) -> bool:
+    """
+    True when "'" is used as an apostrophe inside a word (e.g. don't, user's),
+    not as a string delimiter.
+    """
+    if idx <= 0 or idx >= len(text) - 1 or text[idx] != "'":
+        return False
+    return text[idx - 1].isalpha() and text[idx + 1].isalpha()
+
+
 def _remove_single_think_block(text: str) -> Tuple[str, Dict[str, Any]]:
     open_cnt = len(re.findall(r"<think>", text))
     close_cnt = len(re.findall(r"</think>", text))
@@ -92,7 +102,7 @@ def _split_top_level_commas(s: str, keep_empty: bool = False) -> List[str]:
     in_single = in_double = False
     esc = False
 
-    for ch in s:
+    for idx, ch in enumerate(s):
         if esc:
             buf.append(ch)
             esc = False
@@ -105,7 +115,7 @@ def _split_top_level_commas(s: str, keep_empty: bool = False) -> List[str]:
 
         if in_single:
             buf.append(ch)
-            if ch == "'":
+            if ch == "'" and not _is_word_apostrophe(s, idx):
                 in_single = False
             continue
         if in_double:
@@ -114,7 +124,7 @@ def _split_top_level_commas(s: str, keep_empty: bool = False) -> List[str]:
                 in_double = False
             continue
 
-        if ch == "'":
+        if ch == "'" and not _is_word_apostrophe(s, idx):
             in_single = True
             buf.append(ch)
             continue
@@ -171,7 +181,7 @@ def _balanced_delims(s: str) -> bool:
     in_single = in_double = False
     esc = False
 
-    for ch in s:
+    for idx, ch in enumerate(s):
         if esc:
             esc = False
             continue
@@ -180,7 +190,7 @@ def _balanced_delims(s: str) -> bool:
             continue
 
         if in_single:
-            if ch == "'":
+            if ch == "'" and not _is_word_apostrophe(s, idx):
                 in_single = False
             continue
         if in_double:
@@ -188,7 +198,7 @@ def _balanced_delims(s: str) -> bool:
                 in_double = False
             continue
 
-        if ch == "'":
+        if ch == "'" and not _is_word_apostrophe(s, idx):
             in_single = True
             continue
         if ch == '"':
@@ -291,7 +301,7 @@ def _find_matching_bracket(text: str, start: int) -> Optional[int]:
             i += 1
             continue
         if in_sq:
-            if ch == "'":
+            if ch == "'" and not _is_word_apostrophe(text, i):
                 in_sq = False
             i += 1
             continue
@@ -300,7 +310,7 @@ def _find_matching_bracket(text: str, start: int) -> Optional[int]:
                 in_dq = False
             i += 1
             continue
-        if ch == "'":
+        if ch == "'" and not _is_word_apostrophe(text, i):
             in_sq = True
             i += 1
             continue
@@ -345,7 +355,7 @@ def _scan_bracket_ident_blocks(text: str) -> Tuple[List[BracketIdentBlock], int]
             i += 1
             continue
         if in_sq:
-            if ch == "'":
+            if ch == "'" and not _is_word_apostrophe(text, i):
                 in_sq = False
             i += 1
             continue
@@ -354,7 +364,7 @@ def _scan_bracket_ident_blocks(text: str) -> Tuple[List[BracketIdentBlock], int]
                 in_dq = False
             i += 1
             continue
-        if ch == "'":
+        if ch == "'" and not _is_word_apostrophe(text, i):
             in_sq = True
             i += 1
             continue
