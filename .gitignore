@@ -9,10 +9,13 @@ eval_all.sh
 eval.sh
 generate.sh
 test.py
+./data_all/data_en/dialogue_history
 ./data_all/data_zh/dialogue_history
 *.env
 !.env.template
 run.sh
 test.json
 eval_main_2.py
+dialogue_history
+data_all_jsonl
 # leaderboard/

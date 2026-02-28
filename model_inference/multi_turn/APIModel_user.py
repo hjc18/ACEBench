@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 from openai import OpenAI
 import os
 
@@ -78,8 +79,10 @@ class APIUSER():
 
     def __init__(self, model_name, involved_class, temperature=0.001, top_p=1, max_tokens=1000, language="zh") -> None:
         
+        load_dotenv()
+        
         self.model_name = model_name.lower()
-        if "gpt" in self.model_name:
+        if "gpt" in self.model_name or "glm" in self.model_name:
             api_key = os.getenv("GPT_API_KEY")
             base_url = os.getenv("GPT_BASE_URL")
         elif "deepseek" in self.model_name:
