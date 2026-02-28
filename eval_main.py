@@ -165,7 +165,7 @@ def normal_multi_turn_eval(
         
         try:
             model_result_item_raw = model_result_item
-            model_result_item_raw = "".join(model_result_item_raw.split())
+            model_result_item_raw = extract_outermost_bracket_content(model_result_item_raw)
             model_result_item = decode_ast(model_name, model_result_item_raw)
         except Exception as e:
             result.append(
